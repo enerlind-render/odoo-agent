@@ -9,6 +9,8 @@ import base64
 import hashlib
 import os
 from datetime import datetime, timedelta
+import mimetypes
+from secrets import compare_digest
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Configuración / Seguridad
@@ -20,6 +22,11 @@ ODOO_USER = os.getenv("ODOO_USER", "")
 ODOO_API  = os.getenv("ODOO_API_KEY", "")
 
 API_TOKEN = os.getenv("API_TOKEN", "")  # token para Bearer desde ChatGPT/Agente
+
+try:
+    MAX_ATTACHMENT_MB = float(os.getenv("MAX_ATTACHMENT_MB", "15"))
+except ValueError:
+    MAX_ATTACHMENT_MB = 15.0
 
 if not (ODOO_URL and ODOO_DB and ODOO_USER and ODOO_API):
     raise RuntimeError("Faltan variables ODOO_* en el entorno de Render.")
@@ -44,12 +51,12 @@ app.add_middleware(
 )
 
 def auth(authorization: Optional[str] = Header(None)):
-    """Autenticación Bearer sencilla frente a API_TOKEN."""
+    """Autenticación Bearer segura frente a API_TOKEN."""
     if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(status_code=403, detail="Missing or invalid Authorization header")
+        raise HTTPException(status_code=401, detail="Missing Bearer token")
     token = authorization.split(" ", 1)[1].strip()
-    if token != API_TOKEN:
-        raise HTTPException(status_code=403, detail="Invalid API Token")
+    if not API_TOKEN or not compare_digest(token, API_TOKEN):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
     return True
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -59,9 +66,12 @@ def auth(authorization: Optional[str] = Header(None)):
 def find_currency_id(code_or_name: Optional[str]) -> Optional[int]:
     if not code_or_name:
         return None
-    # Buscar por name o por código
-    domain = ["|", ("name", "=", code_or_name), ("symbol", "=", code_or_name)]
-    ids = models.execute_kw(ODOO_DB, uid, ODOO_API, "res.currency", "search", [domain], {"limit": 1})
+    s = str(code_or_name).strip().upper()
+    ids = models.execute_kw(
+        ODOO_DB, uid, ODOO_API, "res.currency", "search",
+        [[("active", "=", True), "|", ("name", "=", s), ("symbol", "=", s)]],
+        {"limit": 1}
+    )
     return ids[0] if ids else None
 
 def get_company_id() -> int:
@@ -139,6 +149,120 @@ def find_partner(q: Optional[str], vat: Optional[str], limit: int = 10) -> List[
     found.sort(key=lambda x: (-x.get("usage_count", 0), x.get("name", "")))
     return found
 
+def ensure_partner(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Busca o crea un proveedor evitando duplicados (VAT > email > nombre).
+    Actualiza email/phone/vat si faltan en el existente."""
+    name = (data.get("name") or data.get("display_name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="El nombre del proveedor es obligatorio")
+
+    vat = (data.get("vat") or "").strip().upper() or None
+    email = (data.get("email") or "").strip().lower() or None
+    phone = (data.get("phone") or "").strip() or None
+
+    company_partner_id = get_company_partner_id()
+    domain_base = [
+        ("supplier_rank", ">", 0),
+        ("active", "=", True),
+        ("id", "!=", company_partner_id),
+        ("commercial_partner_id", "!=", company_partner_id),
+    ]
+
+    # 1) VAT exacto
+    if vat:
+        vat_ids = models.execute_kw(
+            ODOO_DB, uid, ODOO_API, "res.partner", "search",
+            [[("vat", "=", vat)] + domain_base],
+            {"limit": 1}
+        )
+        if vat_ids:
+            partner = models.execute_kw(ODOO_DB, uid, ODOO_API, "res.partner", "read", [vat_ids, ["id", "name", "vat", "email", "phone"]])[0]
+            updates = {}
+            if email and not partner.get("email"):
+                updates["email"] = email
+            if phone and not partner.get("phone"):
+                updates["phone"] = phone
+            if updates:
+                models.execute_kw(ODOO_DB, uid, ODOO_API, "res.partner", "write", [[partner["id"]], updates])
+                partner.update(updates)
+            return partner
+
+    # 2) Email ilike
+    if email:
+        email_ids = models.execute_kw(
+            ODOO_DB, uid, ODOO_API, "res.partner", "search",
+            [[("email", "ilike", email)] + domain_base],
+            {"limit": 1}
+        )
+        if email_ids:
+            partner = models.execute_kw(ODOO_DB, uid, ODOO_API, "res.partner", "read", [email_ids, ["id", "name", "vat", "email", "phone"]])[0]
+            updates = {}
+            if vat and not partner.get("vat"):
+                updates["vat"] = vat
+            if phone and not partner.get("phone"):
+                updates["phone"] = phone
+            if updates:
+                models.execute_kw(ODOO_DB, uid, ODOO_API, "res.partner", "write", [[partner["id"]], updates])
+                partner.update(updates)
+            return partner
+
+    # 3) Nombre exacto
+    name_ids = models.execute_kw(
+        ODOO_DB, uid, ODOO_API, "res.partner", "search",
+        [[("name", "=", name)] + domain_base],
+        {"limit": 1}
+    )
+    if name_ids:
+        partner = models.execute_kw(ODOO_DB, uid, ODOO_API, "res.partner", "read", [name_ids, ["id", "name", "vat", "email", "phone"]])[0]
+        updates = {}
+        if vat and not partner.get("vat"):
+            updates["vat"] = vat
+        if email and not partner.get("email"):
+            updates["email"] = email
+        if phone and not partner.get("phone"):
+            updates["phone"] = phone
+        if updates:
+            models.execute_kw(ODOO_DB, uid, ODOO_API, "res.partner", "write", [[partner["id"]], updates])
+            partner.update(updates)
+        return partner
+
+    # 4) Nombre ilike (último recurso)
+    ilike_ids = models.execute_kw(
+        ODOO_DB, uid, ODOO_API, "res.partner", "search",
+        [[("name", "ilike", name)] + domain_base],
+        {"limit": 1}
+    )
+    if ilike_ids:
+        partner = models.execute_kw(ODOO_DB, uid, ODOO_API, "res.partner", "read", [ilike_ids, ["id", "name", "vat", "email", "phone"]])[0]
+        updates = {}
+        if vat and not partner.get("vat"):
+            updates["vat"] = vat
+        if email and not partner.get("email"):
+            updates["email"] = email
+        if phone and not partner.get("phone"):
+            updates["phone"] = phone
+        if updates:
+            models.execute_kw(ODOO_DB, uid, ODOO_API, "res.partner", "write", [[partner["id"]], updates])
+            partner.update(updates)
+        return partner
+
+    # 5) Crear proveedor
+    vals = {
+        "name": name,
+        "supplier_rank": 1,
+        "type": "contact",
+    }
+    if vat:
+        vals["vat"] = vat
+    if email:
+        vals["email"] = email
+    if phone:
+        vals["phone"] = phone
+
+    partner_id = models.execute_kw(ODOO_DB, uid, ODOO_API, "res.partner", "create", [vals])
+    partner = models.execute_kw(ODOO_DB, uid, ODOO_API, "res.partner", "read", [[partner_id], ["id", "name", "vat", "email", "phone"]])[0]
+    return partner
+
 def find_account_by_code(code: str) -> Optional[int]:
     """Busca la cuenta contable por código dentro de la compañía actual."""
     if not code:
@@ -150,19 +274,121 @@ def find_account_by_code(code: str) -> Optional[int]:
     )
     return ids[0] if ids else None
 
-def find_taxes_by_names(codes: Optional[str]) -> List[int]:
-    """Recibe 'IVA21,RE7' y devuelve IDs de taxes que contengan esos nombres/códigos."""
-    if not codes:
-        return []
-    result = []
+def find_account_by_reference(code_or_id: Optional[Any]) -> Optional[int]:
+    """Busca la cuenta por ID, 'id:XX', código exacto o nombre exacto."""
+    if not code_or_id:
+        return None
     company_id = get_company_id()
-    for name in [x.strip() for x in codes.split(",") if x.strip()]:
+
+    if isinstance(code_or_id, int):
         ids = models.execute_kw(
-            ODOO_DB, uid, ODOO_API, "account.tax", "search",
-            [[("name", "ilike", name), ("company_id", "=", company_id)]], {"limit": 1}
+            ODOO_DB, uid, ODOO_API, "account.account", "search",
+            [[("id", "=", code_or_id), ("company_id", "=", company_id)]],
+            {"limit": 1}
         )
-        if ids:
-            result.append(ids[0])
+        return ids[0] if ids else None
+
+    s = str(code_or_id).strip()
+    if not s:
+        return None
+
+    if s.lower().startswith("id:"):
+        try:
+            acc_id = int(s.split(":", 1)[1])
+        except ValueError:
+            return None
+        ids = models.execute_kw(
+            ODOO_DB, uid, ODOO_API, "account.account", "search",
+            [[("id", "=", acc_id), ("company_id", "=", company_id)]],
+            {"limit": 1}
+        )
+        return ids[0] if ids else None
+
+    # código exacto
+    ids = models.execute_kw(
+        ODOO_DB, uid, ODOO_API, "account.account", "search",
+        [[("code", "=", s), ("company_id", "=", company_id)]],
+        {"limit": 1}
+    )
+    if ids:
+        return ids[0]
+
+    # nombre exacto
+    ids = models.execute_kw(
+        ODOO_DB, uid, ODOO_API, "account.account", "search",
+        [[("name", "=", s), ("company_id", "=", company_id)]],
+        {"limit": 1}
+    )
+    return ids[0] if ids else None
+
+def _normalize_list_of_strings(value: Optional[Any]) -> List[str]:
+    """Normaliza entradas separadas por comas o listas a una lista de strings."""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        items = value
+    else:
+        items = str(value).split(",")
+    return [str(x).strip() for x in items if str(x).strip()]
+
+def find_taxes_by_names(codes: Optional[Any]) -> List[int]:
+    """Busca impuestos por ID, código interno (description) o nombre."""
+    names = _normalize_list_of_strings(codes)
+    if not names:
+        return []
+    company_id = get_company_id()
+    result: List[int] = []
+
+    for raw in names:
+        s = str(raw).strip()
+        if not s:
+            continue
+
+        # Permitir "id:15"
+        if s.lower().startswith("id:"):
+            try:
+                tax_id = int(s.split(":", 1)[1])
+            except ValueError:
+                tax_id = None
+            if tax_id:
+                exists = models.execute_kw(
+                    ODOO_DB, uid, ODOO_API, "account.tax", "search",
+                    [[("id", "=", tax_id), ("company_id", "=", company_id)]],
+                    {"limit": 1}
+                )
+                if exists:
+                    result.append(exists[0])
+            continue
+
+        # 1) Por código interno exacto (description)
+        code_ids = models.execute_kw(
+            ODOO_DB, uid, ODOO_API, "account.tax", "search",
+            [[("type_tax_use", "!=", "none"), ("company_id", "=", company_id), ("description", "=", s)]],
+            {"limit": 1}
+        )
+        if code_ids:
+            result.append(code_ids[0])
+            continue
+
+        # 2) Por nombre exacto
+        exact_ids = models.execute_kw(
+            ODOO_DB, uid, ODOO_API, "account.tax", "search",
+            [[("name", "=", s), ("company_id", "=", company_id)]],
+            {"limit": 1}
+        )
+        if exact_ids:
+            result.append(exact_ids[0])
+            continue
+
+        # 3) Fuzzy por nombre (último recurso)
+        fuzzy_ids = models.execute_kw(
+            ODOO_DB, uid, ODOO_API, "account.tax", "search",
+            [[("name", "ilike", s), ("company_id", "=", company_id)]],
+            {"limit": 1}
+        )
+        if fuzzy_ids:
+            result.append(fuzzy_ids[0])
+
     return result
 
 def bill_idempotency_key(partner_id: int, ref: str, total: float, inv_date: str) -> str:
@@ -175,6 +401,65 @@ def get_invoice_payable_line_ids(move_id: int) -> List[int]:
         ODOO_DB, uid, ODOO_API, "account.move.line", "search",
         [[("move_id", "=", move_id), ("reconciled", "=", False), ("account_internal_type", "=", "payable")]]
     )
+
+# --- Helpers de adjuntos/PDF ---
+def _sanitize_filename(name: Optional[str]) -> str:
+    base = (name or "adjunto").strip() or "adjunto"
+    return os.path.basename(base)
+
+def _detect_mimetype(filename: str, fallback: str = "application/octet-stream") -> str:
+    guessed, _ = mimetypes.guess_type(filename)
+    return guessed or fallback
+
+def _ensure_binary_payload(data: bytes) -> str:
+    if not data:
+        raise HTTPException(status_code=422, detail="El adjunto está vacío")
+    limit = int(MAX_ATTACHMENT_MB * 1024 * 1024)
+    if len(data) > limit:
+        raise HTTPException(status_code=413, detail=f"Adjunto > {MAX_ATTACHMENT_MB:.0f} MB")
+    return base64.b64encode(data).decode()
+
+def _create_invoice_attachment(move_id: int, filename: str, data: bytes, mimetype: Optional[str] = None) -> int:
+    clean = _sanitize_filename(filename)
+    mt = mimetype or _detect_mimetype(clean)
+    datas = _ensure_binary_payload(data)
+    att_id = models.execute_kw(
+        ODOO_DB, uid, ODOO_API, "ir.attachment", "create", [[{
+            "name": clean,
+            "datas_fname": clean,
+            "res_model": "account.move",
+            "res_id": move_id,
+            "type": "binary",
+            "datas": datas,
+            "mimetype": mt,
+        }]]
+    )
+    return att_id
+
+def _attach_comment(move_id: int, body: str) -> None:
+    try:
+        models.execute_kw(ODOO_DB, uid, ODOO_API, "mail.message", "create", [[{
+            "model": "account.move",
+            "res_id": move_id,
+            "body": body,
+            "message_type": "comment",
+        }]])
+    except Exception:
+        pass  # no romper por chatter
+
+def _handle_inline_attachment(move_id: int, att_b64: Optional[str], att_name: Optional[str]) -> Optional[int]:
+    if not att_b64:
+        return None
+    payload = att_b64.strip()
+    if "base64," in payload:
+        payload = payload.split("base64,", 1)[1]
+    try:
+        raw = base64.b64decode(payload, validate=True)
+    except Exception:
+        raise HTTPException(status_code=422, detail="attachment_b64 inválido")
+    att_id = _create_invoice_attachment(move_id, att_name or "factura.pdf", raw, "application/pdf")
+    _attach_comment(move_id, f"Adjunto (JSON) añadido: {_sanitize_filename(att_name or 'factura.pdf')}")
+    return att_id
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Endpoints
@@ -200,6 +485,11 @@ def providers_search(
 ):
     items = find_partner(q=q, vat=vat, limit=limit)
     return {"count": len(items), "items": items}
+
+@app.post("/odoo/providers/ensure")
+def providers_ensure(payload: Dict[str, Any], authorized: bool = Depends(auth)):
+    partner = ensure_partner(payload)
+    return {"status": "ok", "partner": partner}
 
 # — Facturas proveedor pendientes / parciales ————————————————
 
@@ -253,29 +543,12 @@ async def invoices_attach(
     file: UploadFile = File(...)
 ):
     data = await file.read()
-    b64 = base64.b64encode(data).decode()
-    att_id = models.execute_kw(
-        ODOO_DB, uid, ODOO_API, "ir.attachment", "create", [{
-            "name": file.filename,
-            "res_model": "account.move",
-            "res_id": move_id,
-            "type": "binary",
-            "datas": b64,
-            "mimetype": file.content_type or "application/octet-stream",
-        }]
-    )
-    # Comentario en el chatter
-    models.execute_kw(ODOO_DB, uid, ODOO_API, "mail.message", "create", [{
-        "model": "account.move",
-        "res_id": move_id,
-        "body": f"Adjunto subido: {file.filename}",
-        "message_type": "comment",
-        "subtype_id": 1,
-    }])
+    att_id = _create_invoice_attachment(move_id, file.filename or "adjunto", data, file.content_type or None)
+    _attach_comment(move_id, f"Adjunto subido: {_sanitize_filename(file.filename)}")
     return {"status": "ok", "move_id": move_id, "attachment_id": att_id}
 
 # — Crear factura proveedor (JSON) ————————————————————————————————
-# (B) Añadido: soporta adjunto inline con attachment_b64/attachment_name
+# (B) Añadido: soporta creación/ensure de partner, idempotencia y adjunto inline
 @app.post("/odoo/invoices/create")
 def invoices_create_json(
     payload: Dict[str, Any],
@@ -284,12 +557,22 @@ def invoices_create_json(
     """
     payload:
     {
-      partner_id, invoice_date, ref, currency?, journal_name?, idempotency_key?,
-      lines: [{name, price_unit, account_code?, tax_codes?}],
+      partner_id?  o  partner: {name, vat?, email?, phone?},
+      invoice_date, ref, currency?, journal_name?, idempotency_key?,
+      lines: [{name, price_unit, quantity?, account_id?/account_code?/account?, tax_codes?/tax_ids?}],
       attachment_b64?, attachment_name?
     }
     """
-    partner_id = int(payload["partner_id"])
+    partner_id = payload.get("partner_id")
+    partner_data = payload.get("partner")
+    if not partner_id:
+        if partner_data:
+            partner = ensure_partner(partner_data)
+            partner_id = partner["id"]
+        else:
+            raise HTTPException(status_code=422, detail="Debe indicar partner_id o datos de partner")
+    partner_id = int(partner_id)
+
     invoice_date = payload["invoice_date"]
     ref = payload["ref"]
     lines = payload.get("lines", [])
@@ -316,18 +599,23 @@ def invoices_create_json(
             "existing_move_id": existing_active[0]
         }
 
-    # Idempotency extra (para evitar duplicados silenciosos)
+    # Idempotencia (hash) → se guarda en invoice_origin (no en ref)
     if not idem and lines:
         total = sum(float(l.get("price_unit", 0) or 0) for l in lines)
         idem = bill_idempotency_key(partner_id, ref, total, invoice_date)
 
-    found_by_idem = models.execute_kw(
-        ODOO_DB, uid, ODOO_API, "account.move", "search",
-        [[("move_type", "=", "in_invoice"), ("ref", "=", idem)]],
-        {"limit": 1}
-    )
+    found_by_idem = []
+    if idem:
+        found_by_idem = models.execute_kw(
+            ODOO_DB, uid, ODOO_API, "account.move", "search",
+            [[("move_type", "=", "in_invoice"), ("invoice_origin", "=", idem)]],
+            {"limit": 1}
+        )
+
+    reused_existing = False
     if found_by_idem:
         move_id = found_by_idem[0]
+        reused_existing = True
     else:
         # Journal (opcional)
         journal_id = None
@@ -345,11 +633,18 @@ def invoices_create_json(
         # Crear líneas contables
         aml_lines = []
         for l in lines:
-            account_id = find_account_by_code(l.get("account_code") or "")
-            taxes = find_taxes_by_names(l.get("tax_codes"))
+            account_id = None
+            if "account_id" in l and l.get("account_id") is not None:
+                account_id = find_account_by_reference(l.get("account_id"))
+            if not account_id:
+                account_id = find_account_by_reference(l.get("account_code") or l.get("account"))
+
+            taxes = find_taxes_by_names(l.get("tax_codes") or l.get("tax_ids"))
+
             line_vals = {
                 "name": l.get("name", "Línea"),
                 "price_unit": float(l.get("price_unit", 0) or 0),
+                "quantity": float(l.get("quantity", 1) or 1),
             }
             if account_id:
                 line_vals["account_id"] = account_id
@@ -361,7 +656,8 @@ def invoices_create_json(
             "move_type": "in_invoice",
             "partner_id": partner_id,
             "invoice_date": invoice_date,
-            "ref": idem or ref,
+            "ref": ref,                 # referencia del proveedor intacta
+            "invoice_origin": idem,     # idempotencia
             "invoice_line_ids": aml_lines or [],
         }
         if journal_id:
@@ -370,39 +666,19 @@ def invoices_create_json(
             move_vals["currency_id"] = currency_id
 
         move_id = models.execute_kw(ODOO_DB, uid, ODOO_API, "account.move", "create", [move_vals])
+        _handle_inline_attachment(move_id, payload.get("attachment_b64"), payload.get("attachment_name"))
 
-        # --- Opcional: adjuntar si viene attachment_b64 ---
-        att_b64 = payload.get("attachment_b64")
-        att_name = payload.get("attachment_name", "factura.pdf")
-        if att_b64:
-            try:
-                att_id = models.execute_kw(
-                    ODOO_DB, uid, ODOO_API, "ir.attachment", "create", [{
-                        "name": att_name,
-                        "res_model": "account.move",
-                        "res_id": move_id,
-                        "type": "binary",
-                        "datas": att_b64,
-                        "mimetype": "application/pdf",
-                    }]
-                )
-                models.execute_kw(ODOO_DB, uid, ODOO_API, "mail.message", "create", [{
-                    "model": "account.move",
-                    "res_id": move_id,
-                    "body": f"Adjunto (JSON) añadido: {att_name}",
-                    "message_type": "comment",
-                    "subtype_id": 1,
-                }])
-            except Exception:
-                pass
-
-    return {"status": "created", "move_id": move_id}
+    return {"status": "existing" if reused_existing else "created", "move_id": move_id}
 
 # (C) — Crear factura + adjuntar archivo (multipart “todo en uno”)
 @app.post("/odoo/invoices/create_with_file")
 async def invoices_create_with_file(
     authorized: bool = Depends(auth),
-    partner_id: int = Form(...),
+    partner_id: Optional[int] = Form(None),
+    partner_name: Optional[str] = Form(None),
+    partner_vat: Optional[str] = Form(None),
+    partner_email: Optional[str] = Form(None),
+    partner_phone: Optional[str] = Form(None),
     invoice_date: str = Form(...),
     ref: str = Form(...),
     currency: Optional[str] = Form(None),
@@ -410,7 +686,20 @@ async def invoices_create_with_file(
     auto_validate: bool = Form(False),
     file: UploadFile = File(...)
 ):
-    # 1) Crear factura con una línea placeholder (mantiene tu lógica actual)
+    # 0) Resolver/crear partner
+    if not partner_id:
+        if partner_name or partner_vat or partner_email:
+            partner = ensure_partner({
+                "name": partner_name or "",
+                "vat": partner_vat,
+                "email": partner_email,
+                "phone": partner_phone,
+            })
+            partner_id = partner["id"]
+        else:
+            raise HTTPException(status_code=422, detail="Falta partner_id o datos de partner (partner_name/vat/email).")
+
+    # 1) Crear factura con una línea placeholder
     payload = {
         "partner_id": partner_id,
         "invoice_date": invoice_date,
@@ -424,24 +713,8 @@ async def invoices_create_with_file(
 
     # 2) Adjuntar archivo
     data = await file.read()
-    b64 = base64.b64encode(data).decode()
-    att_id = models.execute_kw(
-        ODOO_DB, uid, ODOO_API, "ir.attachment", "create", [{
-            "name": file.filename,
-            "res_model": "account.move",
-            "res_id": move_id,
-            "type": "binary",
-            "datas": b64,
-            "mimetype": file.content_type or "application/octet-stream",
-        }]
-    )
-    models.execute_kw(ODOO_DB, uid, ODOO_API, "mail.message", "create", [{
-        "model": "account.move",
-        "res_id": move_id,
-        "body": f"Adjunto subido al crear la factura: {file.filename}",
-        "message_type": "comment",
-        "subtype_id": 1,
-    }])
+    att_id = _create_invoice_attachment(move_id, file.filename or "adjunto", data, file.content_type or None)
+    _attach_comment(move_id, f"Adjunto subido al crear la factura: {_sanitize_filename(file.filename)}")
 
     # 3) Validar opcionalmente
     if auto_validate:
@@ -460,11 +733,16 @@ async def invoices_create_from_image(
     ref_hint: Optional[str] = Form(None),
     auto_validate: bool = Form(False)
 ):
-    # 1) Buscar proveedor
+    # 1) Buscar/crear proveedor
     partners = find_partner(q=supplier_hint, vat=vat_hint, limit=1)
-    if not partners:
-        raise HTTPException(status_code=422, detail="No se encontró proveedor con los hints dados.")
-    partner_id = partners[0]["id"]
+    if partners:
+        partner_id = partners[0]["id"]
+    else:
+        if supplier_hint or vat_hint:
+            partner = ensure_partner({"name": supplier_hint or (vat_hint or "Proveedor sin nombre"), "vat": vat_hint})
+            partner_id = partner["id"]
+        else:
+            raise HTTPException(status_code=422, detail="No se encontró proveedor y faltan datos para crearlo (supplier_hint/vat_hint).")
 
     # 2) Crear factura mínima en borrador
     today = datetime.utcnow().date().isoformat()
@@ -479,24 +757,8 @@ async def invoices_create_from_image(
 
     # 3) Adjuntar archivo
     data = await file.read()
-    b64 = base64.b64encode(data).decode()
-    att_id = models.execute_kw(
-        ODOO_DB, uid, ODOO_API, "ir.attachment", "create", [{
-            "name": file.filename,
-            "res_model": "account.move",
-            "res_id": move_id,
-            "type": "binary",
-            "datas": b64,
-            "mimetype": file.content_type or "application/octet-stream",
-        }]
-    )
-    models.execute_kw(ODOO_DB, uid, ODOO_API, "mail.message", "create", [{
-        "model": "account.move",
-        "res_id": move_id,
-        "body": f"Factura creada desde imagen. Adjunto: {file.filename}",
-        "message_type": "comment",
-        "subtype_id": 1,
-    }])
+    att_id = _create_invoice_attachment(move_id, file.filename or "adjunto", data, file.content_type or None)
+    _attach_comment(move_id, f"Factura creada desde imagen. Adjunto: {_sanitize_filename(file.filename)}")
 
     # 4) Validar si procede
     if auto_validate:
