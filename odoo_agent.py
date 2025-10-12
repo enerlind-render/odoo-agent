@@ -11,6 +11,8 @@ import os
 from datetime import datetime, timedelta
 import mimetypes
 from secrets import compare_digest
+import re
+import requests
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Configuración / Seguridad
@@ -21,7 +23,8 @@ ODOO_DB   = os.getenv("ODOO_DB", "")
 ODOO_USER = os.getenv("ODOO_USER", "")
 ODOO_API  = os.getenv("ODOO_API_KEY", "")
 
-API_TOKEN = os.getenv("API_TOKEN", "")  # token para Bearer desde ChatGPT/Agente
+API_TOKEN = os.getenv("API_TOKEN", "")          # token para Bearer desde ChatGPT/Agente
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")  # para resolver file_ de OpenAI (opcional, recomendado)
 
 try:
     MAX_ATTACHMENT_MB = float(os.getenv("MAX_ATTACHMENT_MB", "15"))
@@ -408,11 +411,9 @@ def _sanitize_filename(name: Optional[str]) -> str:
     base = (name or "adjunto").strip() or "adjunto"
     return os.path.basename(base)
 
-
 def _detect_mimetype(filename: str, fallback: str = "application/octet-stream") -> str:
     guessed, _ = mimetypes.guess_type(filename)
     return guessed or fallback
-
 
 def _ensure_binary_payload(data: bytes) -> str:
     if not data:
@@ -421,7 +422,6 @@ def _ensure_binary_payload(data: bytes) -> str:
     if len(data) > limit:
         raise HTTPException(status_code=413, detail=f"Adjunto > {MAX_ATTACHMENT_MB:.0f} MB")
     return base64.b64encode(data).decode()
-
 
 def _decode_b64_forgiving(payload: str) -> bytes:
     """Decodifica base64 aceptando data URLs, saltos de línea, padding faltante y variante urlsafe."""
@@ -442,12 +442,35 @@ def _decode_b64_forgiving(payload: str) -> bytes:
             continue
     raise HTTPException(status_code=422, detail="attachment_b64 inválido")
 
+def _fetch_openai_file(file_id: str) -> bytes:
+    """Descarga el contenido bruto de un file_ de OpenAI Files API."""
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=422, detail="OPENAI_API_KEY no configurada para resolver file_id")
+    url = f"https://api.openai.com/v1/files/{file_id}/content"
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+    r = requests.get(url, headers=headers, timeout=120)
+    if r.status_code != 200:
+        raise HTTPException(status_code=422, detail=f"No se pudo descargar file_id {file_id} (HTTP {r.status_code})")
+    return r.content
+
+def _maybe_resolve_openai_file(data: bytes) -> bytes:
+    """Si 'data' en realidad contiene un identificador 'file_XXXXXXXX', resuélvelo a bytes reales."""
+    try:
+        # Si parece un handle de OpenAI (texto corto)
+        if data and len(data) <= 128:
+            s = data.decode("utf-8", errors="ignore").strip()
+            if re.fullmatch(r"file_[A-Za-z0-9]+", s):
+                return _fetch_openai_file(s)
+    except Exception:
+        # no romper si falla la detección/descarga
+        pass
+    return data
 
 def _create_invoice_attachment(move_id: int, filename: str, data: bytes, mimetype: Optional[str] = None) -> int:
     clean = _sanitize_filename(filename)
     mt = mimetype or _detect_mimetype(clean)
     datas = _ensure_binary_payload(data)
-    # IMPORTANTE: eliminar 'datas_fname' (no existe en tu instancia y provocaba 500)
+    # IMPORTANTE: NO usar 'datas_fname' (no existe en tu instancia y daba 500)
     att_id = models.execute_kw(
         ODOO_DB, uid, ODOO_API, "ir.attachment", "create", [[{
             "name": clean,
@@ -460,7 +483,6 @@ def _create_invoice_attachment(move_id: int, filename: str, data: bytes, mimetyp
     )
     return att_id
 
-
 def _attach_comment(move_id: int, body: str) -> None:
     try:
         models.execute_kw(ODOO_DB, uid, ODOO_API, "mail.message", "create", [[{
@@ -471,7 +493,6 @@ def _attach_comment(move_id: int, body: str) -> None:
         }]])
     except Exception:
         pass  # no romper por chatter
-
 
 def _handle_inline_attachment(move_id: int, att_b64: Optional[str], att_name: Optional[str]) -> Optional[int]:
     if not att_b64:
@@ -489,12 +510,10 @@ def _handle_inline_attachment(move_id: int, att_b64: Optional[str], att_name: Op
 def root():
     return {"message": "Hello from Odoo Agent!"}
 
-
 # Endpoint público para healthchecks (sin auth)
 @app.get("/healthz")
 def healthz():
     return {"ok": True, "service": "odoo-agent", "time": datetime.utcnow().isoformat() + "Z"}
-
 
 @app.get("/odoo/ping")
 def ping(authorized: bool = Depends(auth)):
@@ -512,7 +531,6 @@ def providers_search(
 ):
     items = find_partner(q=q, vat=vat, limit=limit)
     return {"count": len(items), "items": items}
-
 
 @app.post("/odoo/providers/ensure")
 def providers_ensure(payload: Dict[str, Any], authorized: bool = Depends(auth)):
@@ -571,6 +589,8 @@ async def invoices_attach(
     file: UploadFile = File(...)
 ):
     data = await file.read()
+    # Resolver posibles handles de OpenAI tipo file_*
+    data = _maybe_resolve_openai_file(data)
     att_id = _create_invoice_attachment(move_id, file.filename or "adjunto", data, file.content_type or None)
     _attach_comment(move_id, f"Adjunto subido: {_sanitize_filename(file.filename)}")
     return {"status": "ok", "move_id": move_id, "attachment_id": att_id}
@@ -743,6 +763,7 @@ async def invoices_create_with_file(
 
     # 2) Adjuntar archivo
     data = await file.read()
+    data = _maybe_resolve_openai_file(data)
     att_id = _create_invoice_attachment(move_id, file.filename or "adjunto", data, file.content_type or None)
     _attach_comment(move_id, f"Adjunto subido al crear la factura: {_sanitize_filename(file.filename)}")
 
@@ -787,6 +808,7 @@ async def invoices_create_from_image(
 
     # 3) Adjuntar archivo
     data = await file.read()
+    data = _maybe_resolve_openai_file(data)
     att_id = _create_invoice_attachment(move_id, file.filename or "adjunto", data, file.content_type or None)
     _attach_comment(move_id, f"Factura creada desde imagen. Adjunto: {_sanitize_filename(file.filename)}")
 
@@ -872,7 +894,7 @@ def reconciliation_suggest(
             resid = float(mv["amount_residual"] or 0.0)
             i_date = datetime.strptime(mv["invoice_date"], "%Y-%m-%d").date() if mv.get("invoice_date") else None
 
-            # tolerancias
+        # tolerancias
             if abs(b_amount - resid) <= 0.5:
                 days_ok = True
                 if b_date and i_date:
@@ -939,4 +961,3 @@ def task_auto_reconcile(authorized: bool = Depends(auth), min_score: float = 0.9
     high = [m for m in sug["items"] if m["score"] >= min_score]
     res = reconciliation_apply({"matches": [{"bank_line_id": m["bank_line_id"], "move_id": m["move_id"]} for m in high]}, authorized)
     return {"suggested": len(sug["items"]), "applied": len(res["applied"]), "skipped": len(res["skipped"]) }
-
