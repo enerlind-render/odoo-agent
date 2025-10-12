@@ -23,7 +23,7 @@ ODOO_DB   = os.getenv("ODOO_DB", "")
 ODOO_USER = os.getenv("ODOO_USER", "")
 ODOO_API  = os.getenv("ODOO_API_KEY", "")
 
-API_TOKEN = os.getenv("API_TOKEN", "")          # token para Bearer desde ChatGPT/Agente
+API_TOKEN = os.getenv("API_TOKEN", "")            # token para Bearer desde ChatGPT/Agente
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")  # para resolver file_ de OpenAI (opcional, recomendado)
 
 try:
@@ -44,7 +44,7 @@ models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
 
 app = FastAPI(title="Odoo ChatGPT Bridge", version="1.0.0")
 
-# CORS opcional (si necesitas probar desde origenes distintos)
+# CORS opcional (si necesitas probar desde orígenes distintos)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # restringe si quieres
@@ -894,7 +894,7 @@ def reconciliation_suggest(
             resid = float(mv["amount_residual"] or 0.0)
             i_date = datetime.strptime(mv["invoice_date"], "%Y-%m-%d").date() if mv.get("invoice_date") else None
 
-        # tolerancias
+            # tolerancias
             if abs(b_amount - resid) <= 0.5:
                 days_ok = True
                 if b_date and i_date:
