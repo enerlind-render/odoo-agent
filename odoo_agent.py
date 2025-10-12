@@ -8,7 +8,7 @@ import xmlrpc.client
 import base64
 import hashlib
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 import mimetypes
 from secrets import compare_digest
 import re
@@ -24,7 +24,7 @@ ODOO_USER = os.getenv("ODOO_USER", "")
 ODOO_API  = os.getenv("ODOO_API_KEY", "")
 
 API_TOKEN = os.getenv("API_TOKEN", "")            # token para Bearer desde ChatGPT/Agente
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")  # para resolver file_ de OpenAI (opcional, recomendado)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()  # para resolver file_ de OpenAI
 
 try:
     MAX_ATTACHMENT_MB = float(os.getenv("MAX_ATTACHMENT_MB", "15"))
@@ -38,7 +38,7 @@ if not (ODOO_URL and ODOO_DB and ODOO_USER and ODOO_API):
 common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
 uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_API, {})
 if not uid:
-    raise RuntimeError("No se pudo autenticar con Odoo. Revisa ODOO_*.")
+    raise RuntimeError("No se pudo autenticar con Odoo. Revisa ODOO_*. ")
 
 models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
 
@@ -146,7 +146,7 @@ def find_partner(q: Optional[str], vat: Optional[str], limit: int = 10) -> List[
     for f in found:
         cnt = models.execute_kw(
             ODOO_DB, uid, ODOO_API, "account.move", "search_count",
-            [[("move_type", "in", ["in_invoice", "in_refund"]), ("partner_id", "=", f["id"])]]
+            [[("move_type", "in", ["in_invoice", "in_refund"]), ("partner_id", "=", f["id")]]]
         )
         f["usage_count"] = cnt
     found.sort(key=lambda x: (-x.get("usage_count", 0), x.get("name", "")))
@@ -442,29 +442,71 @@ def _decode_b64_forgiving(payload: str) -> bytes:
             continue
     raise HTTPException(status_code=422, detail="attachment_b64 inválido")
 
-def _fetch_openai_file(file_id: str) -> bytes:
-    """Descarga el contenido bruto de un file_ de OpenAI Files API."""
-    if not OPENAI_API_KEY:
-        raise HTTPException(status_code=422, detail="OPENAI_API_KEY no configurada para resolver file_id")
-    url = f"https://api.openai.com/v1/files/{file_id}/content"
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    r = requests.get(url, headers=headers, timeout=120)
-    if r.status_code != 200:
-        raise HTTPException(status_code=422, detail=f"No se pudo descargar file_id {file_id} (HTTP {r.status_code})")
-    return r.content
+# —— Descarga de archivos de OpenAI cuando recibimos un id file_… ——
 
-def _maybe_resolve_openai_file(data: bytes) -> bytes:
-    """Si 'data' en realidad contiene un identificador 'file_XXXXXXXX', resuélvelo a bytes reales."""
+def _download_openai_file(file_id: str) -> tuple[bytes, str, str]:
+    """
+    Descarga el contenido de un id 'file_...' o 'file-...' de OpenAI y devuelve
+    (data_bytes, filename, mimetype_estimado).
+    """
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY no configurada en el servidor")
+
+    url = f"https://api.openai.com/v1/files/{file_id}/content"
     try:
-        # Si parece un handle de OpenAI (texto corto)
-        if data and len(data) <= 128:
-            s = data.decode("utf-8", errors="ignore").strip()
-            if re.fullmatch(r"file_[A-Za-z0-9]+", s):
-                return _fetch_openai_file(s)
-    except Exception:
-        # no romper si falla la detección/descarga
-        pass
-    return data
+        r = requests.get(url, headers={"Authorization": f"Bearer {OPENAI_API_KEY}"}, timeout=60)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Error conectando a OpenAI: {e!s}")
+
+    if r.status_code != 200:
+        snippet = (r.text or "")[:200]
+        raise HTTPException(status_code=422, detail=f"No se pudo descargar {file_id} (HTTP {r.status_code}): {snippet}")
+
+    # Intento de filename desde Content-Disposition
+    fname = None
+    cd = r.headers.get("content-disposition") or ""
+    m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd)
+    if m:
+        fname = m.group(1)
+
+    mt = _detect_mimetype(fname or "") or "application/pdf"
+    return r.content, (fname or f"{file_id}.bin"), mt
+
+async def _resolve_upload_to_bytes(file: UploadFile) -> tuple[bytes, str, str]:
+    """
+    Lee el UploadFile. Si trae un id 'file_...'/'file-...' como texto, lo descarga de OpenAI.
+    Si trae base64 por error, lo decodifica. Si trae binario, lo usa tal cual.
+    Devuelve (data_bytes, filename, mimetype).
+    """
+    raw = await file.read()
+
+    # ¿Parece texto?
+    text = None
+    try:
+        text = raw.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        text = None
+
+    if text:
+        s = text.strip().strip('"').strip("'")
+        # 1) id de OpenAI
+        if re.fullmatch(r'file[_-][A-Za-z0-9]+', s):
+            data, fname, mt = _download_openai_file(s)
+            return data, fname, mt
+        # 2) ¿Base64 mandado por accidente en multipart?
+        if "base64," in s or (len(s) > 120 and re.fullmatch(r"[A-Za-z0-9+/=\s]+", s)):
+            try:
+                data = _decode_b64_forgiving(s)
+                fname = file.filename or "adjunto"
+                mt = _detect_mimetype(fname) or "application/pdf"
+                return data, fname, mt
+            except Exception:
+                pass
+
+    # Binario normal
+    fname = file.filename or "adjunto"
+    mt = file.content_type or _detect_mimetype(fname) or "application/octet-stream"
+    return raw, fname, mt
 
 def _create_invoice_attachment(move_id: int, filename: str, data: bytes, mimetype: Optional[str] = None) -> int:
     clean = _sanitize_filename(filename)
@@ -588,11 +630,9 @@ async def invoices_attach(
     move_id: int = Form(...),
     file: UploadFile = File(...)
 ):
-    data = await file.read()
-    # Resolver posibles handles de OpenAI tipo file_*
-    data = _maybe_resolve_openai_file(data)
-    att_id = _create_invoice_attachment(move_id, file.filename or "adjunto", data, file.content_type or None)
-    _attach_comment(move_id, f"Adjunto subido: {_sanitize_filename(file.filename)}")
+    data, fname, ctype = await _resolve_upload_to_bytes(file)
+    att_id = _create_invoice_attachment(move_id, fname, data, ctype or None)
+    _attach_comment(move_id, f"Adjunto subido: {_sanitize_filename(fname)}")
     return {"status": "ok", "move_id": move_id, "attachment_id": att_id}
 
 # — Crear factura proveedor (JSON) ————————————————————————————————
@@ -671,7 +711,7 @@ def invoices_create_json(
         if journal_name:
             jids = models.execute_kw(
                 ODOO_DB, uid, ODOO_API, "account.journal", "search",
-                [[("name", "=", journal_name), ("type", "in", ["purchase", "general"])]],
+                [[("name", "=", journal_name), ("type", "in", ["purchase", "general")]],
                 {"limit": 1}
             )
             journal_id = jids[0] if jids else None
@@ -761,11 +801,10 @@ async def invoices_create_with_file(
     res = invoices_create_json(payload, authorized)
     move_id = res.get("move_id")
 
-    # 2) Adjuntar archivo
-    data = await file.read()
-    data = _maybe_resolve_openai_file(data)
-    att_id = _create_invoice_attachment(move_id, file.filename or "adjunto", data, file.content_type or None)
-    _attach_comment(move_id, f"Adjunto subido al crear la factura: {_sanitize_filename(file.filename)}")
+    # 2) Adjuntar archivo (resuelve file_..., base64 en multipart, o binario)
+    data, fname, ctype = await _resolve_upload_to_bytes(file)
+    att_id = _create_invoice_attachment(move_id, fname, data, ctype or None)
+    _attach_comment(move_id, f"Adjunto subido al crear la factura: {_sanitize_filename(fname)}")
 
     # 3) Validar opcionalmente
     if auto_validate:
@@ -806,11 +845,10 @@ async def invoices_create_from_image(
     }
     move_id = models.execute_kw(ODOO_DB, uid, ODOO_API, "account.move", "create", [move_vals])
 
-    # 3) Adjuntar archivo
-    data = await file.read()
-    data = _maybe_resolve_openai_file(data)
-    att_id = _create_invoice_attachment(move_id, file.filename or "adjunto", data, file.content_type or None)
-    _attach_comment(move_id, f"Factura creada desde imagen. Adjunto: {_sanitize_filename(file.filename)}")
+    # 3) Adjuntar archivo (resuelve file_..., base64 en multipart, o binario)
+    data, fname, ctype = await _resolve_upload_to_bytes(file)
+    att_id = _create_invoice_attachment(move_id, fname, data, ctype or None)
+    _attach_comment(move_id, f"Factura creada desde imagen. Adjunto: {_sanitize_filename(fname)}")
 
     # 4) Validar si procede
     if auto_validate:
@@ -961,3 +999,4 @@ def task_auto_reconcile(authorized: bool = Depends(auth), min_score: float = 0.9
     high = [m for m in sug["items"] if m["score"] >= min_score]
     res = reconciliation_apply({"matches": [{"bank_line_id": m["bank_line_id"], "move_id": m["move_id"]} for m in high]}, authorized)
     return {"suggested": len(sug["items"]), "applied": len(res["applied"]), "skipped": len(res["skipped"]) }
+
