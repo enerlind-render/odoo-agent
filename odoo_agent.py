@@ -38,7 +38,7 @@ if not (ODOO_URL and ODOO_DB and ODOO_USER and ODOO_API):
 common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
 uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_API, {})
 if not uid:
-    raise RuntimeError("No se pudo autenticar con Odoo. Revisa ODOO_*. ")
+    raise RuntimeError("No se pudo autenticar con Odoo. Revisa ODOO_*.")
 
 models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
 
@@ -146,7 +146,7 @@ def find_partner(q: Optional[str], vat: Optional[str], limit: int = 10) -> List[
     for f in found:
         cnt = models.execute_kw(
             ODOO_DB, uid, ODOO_API, "account.move", "search_count",
-            [[("move_type", "in", ["in_invoice", "in_refund"]), ("partner_id", "=", f["id")]]]
+            [[("move_type", "in", ["in_invoice", "in_refund"]), ("partner_id", "=", f["id"])]]  # FIX: corchete
         )
         f["usage_count"] = cnt
     found.sort(key=lambda x: (-x.get("usage_count", 0), x.get("name", "")))
@@ -711,7 +711,7 @@ def invoices_create_json(
         if journal_name:
             jids = models.execute_kw(
                 ODOO_DB, uid, ODOO_API, "account.journal", "search",
-                [[("name", "=", journal_name), ("type", "in", ["purchase", "general")]],
+                [[("name", "=", journal_name), ("type", "in", ["purchase", "general"])]],  # FIX: corchete
                 {"limit": 1}
             )
             journal_id = jids[0] if jids else None
@@ -998,5 +998,4 @@ def task_auto_reconcile(authorized: bool = Depends(auth), min_score: float = 0.9
     sug = reconciliation_suggest(authorized)
     high = [m for m in sug["items"] if m["score"] >= min_score]
     res = reconciliation_apply({"matches": [{"bank_line_id": m["bank_line_id"], "move_id": m["move_id"]} for m in high]}, authorized)
-    return {"suggested": len(sug["items"]), "applied": len(res["applied"]), "skipped": len(res["skipped"]) }
-
+    return {"suggested": len(sug["items"]), "applied": len(res["applied"]), "skipped": len(res["skipped"])}
