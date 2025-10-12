@@ -403,13 +403,16 @@ def get_invoice_payable_line_ids(move_id: int) -> List[int]:
     )
 
 # --- Helpers de adjuntos/PDF ---
+
 def _sanitize_filename(name: Optional[str]) -> str:
     base = (name or "adjunto").strip() or "adjunto"
     return os.path.basename(base)
 
+
 def _detect_mimetype(filename: str, fallback: str = "application/octet-stream") -> str:
     guessed, _ = mimetypes.guess_type(filename)
     return guessed or fallback
+
 
 def _ensure_binary_payload(data: bytes) -> str:
     if not data:
@@ -419,14 +422,35 @@ def _ensure_binary_payload(data: bytes) -> str:
         raise HTTPException(status_code=413, detail=f"Adjunto > {MAX_ATTACHMENT_MB:.0f} MB")
     return base64.b64encode(data).decode()
 
+
+def _decode_b64_forgiving(payload: str) -> bytes:
+    """Decodifica base64 aceptando data URLs, saltos de línea, padding faltante y variante urlsafe."""
+    s = payload.strip()
+    if "base64," in s:
+        s = s.split("base64,", 1)[1]
+    # quitar espacios y saltos de línea
+    s = "".join(s.split())
+    if not s:
+        raise HTTPException(status_code=422, detail="attachment_b64 vacío")
+    # padding a múltiplos de 4
+    s = s + "=" * (-len(s) % 4)
+    # intentar decodificación estándar y urlsafe
+    for decoder in (base64.b64decode, base64.urlsafe_b64decode):
+        try:
+            return decoder(s)
+        except Exception:
+            continue
+    raise HTTPException(status_code=422, detail="attachment_b64 inválido")
+
+
 def _create_invoice_attachment(move_id: int, filename: str, data: bytes, mimetype: Optional[str] = None) -> int:
     clean = _sanitize_filename(filename)
     mt = mimetype or _detect_mimetype(clean)
     datas = _ensure_binary_payload(data)
+    # IMPORTANTE: eliminar 'datas_fname' (no existe en tu instancia y provocaba 500)
     att_id = models.execute_kw(
         ODOO_DB, uid, ODOO_API, "ir.attachment", "create", [[{
             "name": clean,
-            "datas_fname": clean,
             "res_model": "account.move",
             "res_id": move_id,
             "type": "binary",
@@ -435,6 +459,7 @@ def _create_invoice_attachment(move_id: int, filename: str, data: bytes, mimetyp
         }]]
     )
     return att_id
+
 
 def _attach_comment(move_id: int, body: str) -> None:
     try:
@@ -447,16 +472,11 @@ def _attach_comment(move_id: int, body: str) -> None:
     except Exception:
         pass  # no romper por chatter
 
+
 def _handle_inline_attachment(move_id: int, att_b64: Optional[str], att_name: Optional[str]) -> Optional[int]:
     if not att_b64:
         return None
-    payload = att_b64.strip()
-    if "base64," in payload:
-        payload = payload.split("base64,", 1)[1]
-    try:
-        raw = base64.b64decode(payload, validate=True)
-    except Exception:
-        raise HTTPException(status_code=422, detail="attachment_b64 inválido")
+    raw = _decode_b64_forgiving(att_b64)
     att_id = _create_invoice_attachment(move_id, att_name or "factura.pdf", raw, "application/pdf")
     _attach_comment(move_id, f"Adjunto (JSON) añadido: {_sanitize_filename(att_name or 'factura.pdf')}")
     return att_id
@@ -468,6 +488,13 @@ def _handle_inline_attachment(move_id: int, att_b64: Optional[str], att_name: Op
 @app.get("/")
 def root():
     return {"message": "Hello from Odoo Agent!"}
+
+
+# Endpoint público para healthchecks (sin auth)
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "service": "odoo-agent", "time": datetime.utcnow().isoformat() + "Z"}
+
 
 @app.get("/odoo/ping")
 def ping(authorized: bool = Depends(auth)):
@@ -485,6 +512,7 @@ def providers_search(
 ):
     items = find_partner(q=q, vat=vat, limit=limit)
     return {"count": len(items), "items": items}
+
 
 @app.post("/odoo/providers/ensure")
 def providers_ensure(payload: Dict[str, Any], authorized: bool = Depends(auth)):
@@ -549,6 +577,7 @@ async def invoices_attach(
 
 # — Crear factura proveedor (JSON) ————————————————————————————————
 # (B) Añadido: soporta creación/ensure de partner, idempotencia y adjunto inline
+
 @app.post("/odoo/invoices/create")
 def invoices_create_json(
     payload: Dict[str, Any],
@@ -671,6 +700,7 @@ def invoices_create_json(
     return {"status": "existing" if reused_existing else "created", "move_id": move_id}
 
 # (C) — Crear factura + adjuntar archivo (multipart “todo en uno”)
+
 @app.post("/odoo/invoices/create_with_file")
 async def invoices_create_with_file(
     authorized: bool = Depends(auth),
@@ -908,4 +938,5 @@ def task_auto_reconcile(authorized: bool = Depends(auth), min_score: float = 0.9
     sug = reconciliation_suggest(authorized)
     high = [m for m in sug["items"] if m["score"] >= min_score]
     res = reconciliation_apply({"matches": [{"bank_line_id": m["bank_line_id"], "move_id": m["move_id"]} for m in high]}, authorized)
-    return {"suggested": len(sug["items"]), "applied": len(res["applied"]), "skipped": len(res["skipped"])}
+    return {"suggested": len(sug["items"]), "applied": len(res["applied"]), "skipped": len(res["skipped"]) }
+
