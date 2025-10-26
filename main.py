@@ -27,8 +27,8 @@ class OdooClient:
         self.url = (os.getenv("ODOO_URL") or "").rstrip("/")
         self.db = os.getenv("ODOO_DB") or ""
         self.user = os.getenv("ODOO_USER") or ""
-        # 👇 AQUI PONES TU API KEY DE ODOO (en Render/.env, variable ODOO_PASSWORD)
-        self.password = os.getenv("ODOO_PASSWORD") or ""
+        # (1) Password/API Key: acepta ODOO_PASSWORD o ODOO_API_KEY
+        self.password = os.getenv("ODOO_PASSWORD") or os.getenv("ODOO_API_KEY") or ""
         self.uid: Optional[int] = None
 
     def _jsonrpc(self, service: str, method: str, *args, **kwargs) -> Any:
@@ -78,19 +78,24 @@ class OdooClient:
     def write(self, model: str, ids: list[int], vals: dict):
         return self.execute_kw(model, "write", [ids, vals], {})
 
-    def read_group(self, model: str, domain: list, fields: list[str], groupby: list[str], orderby: str | None = None):
-        kw = {"fields": fields, "groupby": groupby}
+    # (2) read_group con args posicionales correctos
+    def read_group(self, model: str, domain: list, fields: list[str], groupby: list[str],
+                   orderby: str | None = None, limit: int | None = None):
+        kw = {}
         if orderby:
             kw["orderby"] = orderby
-        return self.execute_kw(model, "read_group", [domain], kw)
+        if limit:
+            kw["limit"] = limit
+        return self.execute_kw(model, "read_group", [domain, fields, groupby], kw)
 
 # ---------- OCR / PARSER ----------
+# (3) Lectura PDF robusta con BytesIO
 def _extract_text_pdf(pdf_bytes: bytes) -> str:
     try:
-        reader = PdfReader.from_bytes(pdf_bytes)
+        reader = PdfReader(io.BytesIO(pdf_bytes))
     except Exception:
-        reader = PdfReader(pdf_bytes)
-    out=[]
+        return ""
+    out = []
     for p in reader.pages:
         try:
             t = p.extract_text() or ""
@@ -163,7 +168,7 @@ def parse_invoice_content(filename: str, file_b64: str) -> dict:
     for ln in lines:
         if re.search(r"(concepto|descripción|servicio|detalle)", ln, re.IGNORECASE):
             idx = lines.index(ln)
-            desc = " ".join(lines[idx : idx + 5])[:240]
+            desc = " ".join(lines[idx: idx + 5])[:240]
             break
     if not desc:
         desc = " ".join(lines[:8])[:240]
@@ -258,51 +263,65 @@ def t_parse(body: ParseReq, _=Depends(require_api_key)):
 def t_check_partner(body: PartnerExistReq, _=Depends(require_api_key)):
     my_vat = (os.getenv("COMPANY_VAT") or "").upper().replace(" ", "")
     odoo = OdooClient(); odoo.authenticate()
-    cand=[]
+    cand = []
 
     # VAT exacto
     if body.vat:
-        ids = odoo.search("res.partner", [["vat","=",body.vat]], limit=10)
+        ids = odoo.search("res.partner", [["vat", "=", body.vat]], limit=10)
         if ids:
-            recs = odoo.read("res.partner", ids, ["name","vat","supplier_rank"])
+            recs = odoo.read("res.partner", ids, ["name", "vat", "supplier_rank"])
             for r in recs:
-                v=(r.get("vat") or "").upper().replace(" ","")
-                if v == my_vat: continue
+                v = (r.get("vat") or "").upper().replace(" ", "")
+                if v == my_vat:
+                    continue
                 cand.append({"id": r["id"], "name": r["name"], "vat": r.get("vat"), "score": 1.0})
 
     # Nombre aproximado
     if body.name:
-        domain=[["supplier_rank",">",0],["active","=",True],["name","ilike",body.name]]
-        recs = odoo.search_read("res.partner", domain, ["name","vat"], limit=50)
+        domain = [["supplier_rank", ">", 0], ["active", "=", True], ["name", "ilike", body.name]]
+        recs = odoo.search_read("res.partner", domain, ["name", "vat"], limit=50)
         from difflib import SequenceMatcher
         for r in recs:
-            v=(r.get("vat") or "").upper().replace(" ","")
-            if v == my_vat: continue
+            v = (r.get("vat") or "").upper().replace(" ", "")
+            if v == my_vat:
+                continue
             sc = SequenceMatcher(None, body.name.lower(), (r["name"] or "").lower()).ratio()
-            cand.append({"id": r["id"], "name": r["name"], "vat": r.get("vat"), "score": round(sc,3)})
+            cand.append({"id": r["id"], "name": r["name"], "vat": r.get("vat"), "score": round(sc, 3)})
 
     # Ranking por uso
     if cand:
-        ids=[c["id"] for c in cand]
-        rg = odoo.read_group("account.move",
-            [["move_type","in",["in_invoice","in_refund"]],["partner_id","in",ids]],
-            ["id:count"], ["partner_id"], orderby="id_count desc")
-        usage = { (it["partner_id"][0] if isinstance(it.get("partner_id"), (list,tuple)) else None): it.get("id_count",0) for it in rg }
-        for c in cand: c["usage"] = usage.get(c["id"],0)
+        ids = [c["id"] for c in cand]
+        rg = odoo.read_group(
+            "account.move",
+            [["move_type", "in", ["in_invoice", "in_refund"]], ["partner_id", "in", ids]],
+            ["id:count"],
+            ["partner_id"],
+            orderby="id_count desc",
+        )
+        usage = {
+            (it["partner_id"][0] if isinstance(it.get("partner_id"), (list, tuple)) else None): it.get("id_count", 0)
+            for it in rg
+        }
+        for c in cand:
+            c["usage"] = usage.get(c["id"], 0)
 
-    cand = sorted(cand, key=lambda x: (x.get("score",0), x.get("usage",0)), reverse=True)
+    cand = sorted(cand, key=lambda x: (x.get("score", 0), x.get("usage", 0)), reverse=True)
     return {"candidates": cand}
 
 @app.post("/tools/supplier_usage_rank")
 def t_usage(body: SupplierUsageReq, _=Depends(require_api_key)):
     odoo = OdooClient(); odoo.authenticate()
-    rg = odoo.read_group("account.move",
-        [["move_type","in",["in_invoice","in_refund"]],["partner_id","in",body.partner_ids]],
-        ["id:count"], ["partner_id"], orderby="id_count desc")
-    data=[]
+    rg = odoo.read_group(
+        "account.move",
+        [["move_type", "in", ["in_invoice", "in_refund"]], ["partner_id", "in", body.partner_ids]],
+        ["id:count"],
+        ["partner_id"],
+        orderby="id_count desc",
+    )
+    data = []
     for it in rg:
-        pid = it["partner_id"][0] if isinstance(it.get("partner_id"),(list,tuple)) else None
-        data.append({"partner_id": pid, "invoice_count": it.get("id_count",0)})
+        pid = it["partner_id"][0] if isinstance(it.get("partner_id"), (list, tuple)) else None
+        data.append({"partner_id": pid, "invoice_count": it.get("id_count", 0)})
     return {"usage": data}
 
 @app.post("/tools/create_supplier_partner")
@@ -313,50 +332,60 @@ def t_create_partner(body: CreateSupplierReq, _=Depends(require_api_key)):
         "supplier_rank": 1,
         "company_type": body.company_type or "company",
     }
-    for k in ["vat","email","phone","street","city","zip"]:
+    for k in ["vat", "email", "phone", "street", "city", "zip"]:
         v = getattr(body, k, None)
-        if v: vals[k] = v
+        if v:
+            vals[k] = v
     if body.country_code:
-        cid = odoo.search("res.country",[["code","=",body.country_code]],limit=1)
-        if cid: vals["country_id"] = cid[0]
+        cid = odoo.search("res.country", [["code", "=", body.country_code]], limit=1)
+        if cid:
+            vals["country_id"] = cid[0]
     pid = odoo.create("res.partner", vals)
     return {"partner_id": pid}
 
 @app.post("/tools/resolve_account")
 def t_resolve_account(body: ResolveAccountReq, _=Depends(require_api_key)):
     odoo = OdooClient(); odoo.authenticate()
-    dom=[["code","=",body.account_code]]
-    if body.company_id: dom.append(["company_id","=",body.company_id])
+    dom = [["code", "=", body.account_code]]
+    if body.company_id:
+        dom.append(["company_id", "=", body.company_id])
     ids = odoo.search("account.account", dom, limit=1)
     return {"account_id": ids[0]} if ids else {"account_id": None}
 
 @app.post("/tools/resolve_taxes")
 def t_resolve_taxes(body: ResolveTaxesReq, _=Depends(require_api_key)):
     odoo = OdooClient(); odoo.authenticate()
-    tax_ids=[]
+    tax_ids = []
     for code in (body.codes or []):
-        dom=[["type_tax_use","in",["purchase","none"]],["description","=",code]]
-        if body.company_id: dom.append(["company_id","=",body.company_id])
+        dom = [["type_tax_use", "in", ["purchase", "none"]], ["description", "=", code]]
+        if body.company_id:
+            dom.append(["company_id", "=", body.company_id])
         ids = odoo.search("account.tax", dom, limit=1)
-        if ids: tax_ids+=ids
+        if ids:
+            tax_ids += ids
     for name in (body.names or []):
-        dom=[["type_tax_use","in",["purchase","none"]],["name","ilike",name]]
-        if body.company_id: dom.append(["company_id","=",body.company_id])
+        dom = [["type_tax_use", "in", ["purchase", "none"]], ["name", "ilike", name]]
+        if body.company_id:
+            dom.append(["company_id", "=", body.company_id])
         ids = odoo.search("account.tax", dom, limit=1)
-        if ids: tax_ids+=ids
-    tax_ids=list(dict.fromkeys(tax_ids))
+        if ids:
+            tax_ids += ids
+    tax_ids = list(dict.fromkeys(tax_ids))
     return {"tax_ids": tax_ids}
 
 @app.post("/tools/check_duplicate")
 def t_check_dup(body: CheckDupReq, _=Depends(require_api_key)):
     odoo = OdooClient(); odoo.authenticate()
-    dom=[["move_type","=","in_invoice"],["partner_id","=",body.partner_id],["ref","=",body.ref]]
+    dom = [["move_type", "=", "in_invoice"], ["partner_id", "=", body.partner_id], ["ref", "=", body.ref]]
     ids = odoo.search("account.move", dom, limit=1)
     if ids:
         return {"exists": True, "move_id": ids[0], "reason": "partner+ref"}
-    near = odoo.search_read("account.move",
-        [["move_type","=","in_invoice"],["partner_id","=",body.partner_id]],
-        ["id","amount_total"], limit=50)
+    near = odoo.search_read(
+        "account.move",
+        [["move_type", "=", "in_invoice"], ["partner_id", "=", body.partner_id]],
+        ["id", "amount_total"],
+        limit=50,
+    )
     for r in near:
         if abs((r.get("amount_total") or 0.0) - body.total) <= body.tolerance * max(1.0, body.total):
             return {"exists": True, "move_id": r["id"], "reason": "amount_total ~"}
@@ -365,42 +394,52 @@ def t_check_dup(body: CheckDupReq, _=Depends(require_api_key)):
 @app.post("/tools/create_vendor_bill")
 def t_create_bill(body: CreateBillReq, _=Depends(require_api_key)):
     odoo = OdooClient(); odoo.authenticate()
-    acc = odoo.search("account.account",[["code","=",body.line.account_code]],limit=1)
+    acc = odoo.search("account.account", [["code", "=", body.line.account_code]], limit=1)
     if not acc:
         raise HTTPException(400, detail=f"Cuenta {body.line.account_code} no existe")
-    tax_ids=[]
+    tax_ids = []
     for code in (body.line.tax_codes or []):
-        dom=[["type_tax_use","in",["purchase","none"]],["description","=",code]]
-        if body.company_id: dom.append(["company_id","=",body.company_id])
-        ids = odoo.search("account.tax", dom, limit=1); tax_ids+=ids
+        dom = [["type_tax_use", "in", ["purchase", "none"]], ["description", "=", code]]
+        if body.company_id:
+            dom.append(["company_id", "=", body.company_id])
+        ids = odoo.search("account.tax", dom, limit=1)
+        tax_ids += ids
     for name in (body.line.tax_names or []):
-        dom=[["type_tax_use","in",["purchase","none"]],["name","ilike",name]]
-        if body.company_id: dom.append(["company_id","=",body.company_id])
-        ids = odoo.search("account.tax", dom, limit=1); tax_ids+=ids
+        dom = [["type_tax_use", "in", ["purchase", "none"]], ["name", "ilike", name]]
+        if body.company_id:
+            dom.append(["company_id", "=", body.company_id])
+        ids = odoo.search("account.tax", dom, limit=1)
+        tax_ids += ids
     tax_ids = list(dict.fromkeys(tax_ids))
     # product "Sin producto"
-    prod=None
+    prod = None
     if body.line.product_name:
-        dom=[["name","=",body.line.product_name]]
-        if body.company_id: dom.append(["company_id","in",[body.company_id,False]])
+        dom = [["name", "=", body.line.product_name]]
+        if body.company_id:
+            dom.append(["company_id", "in", [body.company_id, False]])
         pids = odoo.search("product.product", dom, limit=1)
-        if pids: prod=pids[0]
+        if pids:
+            prod = pids[0]
     line_vals = {
         "name": body.line.name,
         "quantity": body.line.quantity,
         "price_unit": body.line.price_unit,
         "account_id": acc[0],
     }
-    if prod: line_vals["product_id"]=prod
-    if tax_ids: line_vals["tax_ids"]=[(6,0,tax_ids)]
+    if prod:
+        line_vals["product_id"] = prod
+    if tax_ids:
+        line_vals["tax_ids"] = [(6, 0, tax_ids)]
     mv = {
-        "move_type":"in_invoice",
+        "move_type": "in_invoice",
         "partner_id": body.partner_id,
         "invoice_date": body.invoice_date,
-        "invoice_line_ids":[(0,0,line_vals)]
+        "invoice_line_ids": [(0, 0, line_vals)],
     }
-    if body.company_id: mv["company_id"]=body.company_id
-    if body.ref: mv["ref"]=body.ref
+    if body.company_id:
+        mv["company_id"] = body.company_id
+    if body.ref:
+        mv["ref"] = body.ref
     move_id = odoo.create("account.move", mv)
     return {"move_id": move_id}
 
@@ -413,7 +452,7 @@ def t_attach(body: AttachReq, _=Depends(require_api_key)):
         "res_id": body.move_id,
         "type": "binary",
         "datas": body.file_b64,
-        "mimetype": "application/pdf" if body.filename.lower().endswith(".pdf") else None
+        "mimetype": "application/pdf" if body.filename.lower().endswith(".pdf") else None,
     }
     att_id = odoo.create("ir.attachment", vals)
     return {"attachment_id": att_id}
