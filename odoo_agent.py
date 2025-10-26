@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, time, base64, re, io
+import os, time, base64, re, io, logging
 from typing import Any, List, Optional
 import requests
 from fastapi import FastAPI, Depends, Header, HTTPException, status
@@ -27,11 +27,13 @@ class OdooClient:
         self.url = (os.getenv("ODOO_URL") or "").rstrip("/")
         self.db = os.getenv("ODOO_DB") or ""
         self.user = os.getenv("ODOO_USER") or ""
-        # (1) Password/API Key: acepta ODOO_PASSWORD o ODOO_API_KEY
+        # Acepta ODOO_PASSWORD o ODOO_API_KEY como credencial
         self.password = os.getenv("ODOO_PASSWORD") or os.getenv("ODOO_API_KEY") or ""
         self.uid: Optional[int] = None
 
     def _jsonrpc(self, service: str, method: str, *args, **kwargs) -> Any:
+        if not self.url:
+            raise RuntimeError("Falta ODOO_URL")
         payload = {
             "jsonrpc": "2.0",
             "method": "call",
@@ -46,6 +48,8 @@ class OdooClient:
         return data.get("result")
 
     def authenticate(self) -> int:
+        if not self.db or not self.user or not self.password:
+            raise RuntimeError("Faltan ODOO_DB/ODOO_USER/ODOO_PASSWORD")
         self.uid = self._jsonrpc("common", "authenticate", self.db, self.user, self.password, {})
         if not self.uid:
             raise RuntimeError("Odoo authentication failed")
@@ -78,7 +82,6 @@ class OdooClient:
     def write(self, model: str, ids: list[int], vals: dict):
         return self.execute_kw(model, "write", [ids, vals], {})
 
-    # (2) read_group con args posicionales correctos
     def read_group(self, model: str, domain: list, fields: list[str], groupby: list[str],
                    orderby: str | None = None, limit: int | None = None):
         kw = {}
@@ -86,10 +89,10 @@ class OdooClient:
             kw["orderby"] = orderby
         if limit:
             kw["limit"] = limit
+        # args posicionales correctos: [domain, fields, groupby]
         return self.execute_kw(model, "read_group", [domain, fields, groupby], kw)
 
 # ---------- OCR / PARSER ----------
-# (3) Lectura PDF robusta con BytesIO
 def _extract_text_pdf(pdf_bytes: bytes) -> str:
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
@@ -192,6 +195,15 @@ app = FastAPI(title="Odoo Invoice Tools")
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+# Endpoint de diagnóstico para credenciales de Odoo
+@app.get("/debug/odoo_auth")
+def debug_odoo_auth():
+    try:
+        uid = OdooClient().authenticate()
+        return {"ok": True, "uid": uid}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 # ---- MODELOS (request) ----
 class ParseReq(BaseModel):
@@ -456,3 +468,4 @@ def t_attach(body: AttachReq, _=Depends(require_api_key)):
     }
     att_id = odoo.create("ir.attachment", vals)
     return {"attachment_id": att_id}
+
