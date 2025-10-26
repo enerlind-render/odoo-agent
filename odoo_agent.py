@@ -1,14 +1,16 @@
 from __future__ import annotations
 import os, time, base64, re, io, logging
 from typing import Any, List, Optional
+
 import requests
 from fastapi import FastAPI, Depends, Header, HTTPException, status, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from pypdf import PdfReader
 from pdf2image import convert_from_bytes
 from PIL import Image
 import pytesseract
-from fastapi.responses import JSONResponse
+
 
 # ---------- SEGURIDAD ----------
 def require_api_key(
@@ -21,6 +23,7 @@ def require_api_key(
     expected = os.getenv("API_KEY") or os.getenv("API_TOKEN")
     if not expected or provided != expected:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid API key")
+
 
 # ---------- CLIENTE ODOO (JSON-RPC) ----------
 class OdooClient:
@@ -83,8 +86,10 @@ class OdooClient:
     def write(self, model: str, ids: list[int], vals: dict):
         return self.execute_kw(model, "write", [ids, vals], {})
 
-    def read_group(self, model: str, domain: list, fields: list[str], groupby: list[str],
-                   orderby: str | None = None, limit: int | None = None):
+    def read_group(
+        self, model: str, domain: list, fields: list[str], groupby: list[str],
+        orderby: str | None = None, limit: int | None = None
+    ):
         kw = {}
         if orderby:
             kw["orderby"] = orderby
@@ -93,37 +98,26 @@ class OdooClient:
         # args posicionales correctos: [domain, fields, groupby]
         return self.execute_kw(model, "read_group", [domain, fields, groupby], kw)
 
-# ---------- BASE64 Helper ----------
+
+# ---------- UTILIDADES ----------
 def _normalize_b64(s: str) -> str:
     """
-    Limpia y normaliza una cadena base64:
-    - Soporta 'data:...;base64,'
-    - Elimina espacios/saltos
-    - Corrige caracteres url-safe y padding
-    - Valida decodificando y vuelve a codificar estándar
+    Limpia cabeceras data:, elimina espacios y corrige padding para base64.
     """
     if not s:
-        raise ValueError("file_b64 vacío")
-    # Quitar prefijo data URL
-    if s.startswith("data:"):
-        parts = s.split(",", 1)
-        s = parts[1] if len(parts) > 1 else ""
-    # Limpiar
+        return s
     s = s.strip()
+    # Si viene como data:application/pdf;base64,AAAA...
+    if "," in s and ";base64" in s.split(",", 1)[0]:
+        s = s.split(",", 1)[1]
+    # quitar whitespace
     s = re.sub(r"\s+", "", s)
-    # Reemplazos comunes
-    s = s.replace(" ", "+").replace("-", "+").replace("_", "/")
-    # Padding
-    pad = (-len(s)) % 4
-    if pad:
-        s += "=" * pad
-    # Validar y normalizar
-    try:
-        raw = base64.b64decode(s, validate=True)
-    except Exception:
-        # último intento: añadir padding extra
-        raw = base64.b64decode(s + "==")
-    return base64.b64encode(raw).decode("ascii")
+    # padding
+    missing = (-len(s)) % 4
+    if missing:
+        s += "=" * missing
+    return s
+
 
 # ---------- OCR / PARSER ----------
 def _extract_text_pdf(pdf_bytes: bytes) -> str:
@@ -141,14 +135,17 @@ def _extract_text_pdf(pdf_bytes: bytes) -> str:
             out.append(t)
     return "\n".join(out)
 
+
 def _ocr_pdf(pdf_bytes: bytes) -> str:
     images = convert_from_bytes(pdf_bytes, dpi=200, fmt="png")
     parts = [pytesseract.image_to_string(img, lang="spa+eng") for img in images]
     return "\n".join(parts)
 
+
 def _ocr_image(img_bytes: bytes) -> str:
     img = Image.open(io.BytesIO(img_bytes))
     return pytesseract.image_to_string(img, lang="spa+eng")
+
 
 def parse_invoice_content(filename: str, file_b64: str) -> dict:
     raw = base64.b64decode(_normalize_b64(file_b64))
@@ -204,7 +201,7 @@ def parse_invoice_content(filename: str, file_b64: str) -> dict:
     for ln in lines:
         if re.search(r"(concepto|descripción|servicio|detalle)", ln, re.IGNORECASE):
             idx = lines.index(ln)
-            desc = " ".join(lines[idx: idx + 5])[:240]
+            desc = " ".join(lines[idx : idx + 5])[:240]
             break
     if not desc:
         desc = " ".join(lines[:8])[:240]
@@ -222,12 +219,15 @@ def parse_invoice_content(filename: str, file_b64: str) -> dict:
         "ocr_conf": round(conf, 2),
     }
 
+
 # ---------- FASTAPI ----------
 app = FastAPI(title="Odoo Invoice Tools")
+
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
 
 # Endpoint de diagnóstico para credenciales de Odoo
 @app.get("/debug/odoo_auth")
@@ -238,18 +238,22 @@ def debug_odoo_auth():
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+
 # ---- MODELOS (request) ----
 class ParseReq(BaseModel):
     filename: str
     file_b64: str
+
 
 class PartnerExistReq(BaseModel):
     vat: Optional[str] = None
     name: Optional[str] = None
     country_code: Optional[str] = None
 
+
 class SupplierUsageReq(BaseModel):
     partner_ids: List[int]
+
 
 class CreateSupplierReq(BaseModel):
     name: str
@@ -263,20 +267,24 @@ class CreateSupplierReq(BaseModel):
     country_code: Optional[str] = None
     notes: Optional[str] = None
 
+
 class ResolveAccountReq(BaseModel):
     account_code: str
     company_id: Optional[int] = None
+
 
 class ResolveTaxesReq(BaseModel):
     names: Optional[List[str]] = None
     codes: Optional[List[str]] = None
     company_id: Optional[int] = None
 
+
 class CheckDupReq(BaseModel):
     partner_id: int
     ref: str
     total: float
     tolerance: float = 0.02
+
 
 class CreateBillLine(BaseModel):
     name: str
@@ -287,6 +295,7 @@ class CreateBillLine(BaseModel):
     tax_names: Optional[List[str]] = None
     tax_codes: Optional[List[str]] = None
 
+
 class CreateBillReq(BaseModel):
     partner_id: int
     invoice_date: str  # YYYY-MM-DD
@@ -294,15 +303,18 @@ class CreateBillReq(BaseModel):
     company_id: Optional[int] = None
     line: CreateBillLine
 
+
 class AttachReq(BaseModel):
     move_id: int
     filename: str
     file_b64: str
 
+
 # ---------- ENDPOINTS / TOOLS ----------
 @app.post("/tools/parse_invoice")
 def t_parse(body: ParseReq, _=Depends(require_api_key)):
     return parse_invoice_content(body.filename, body.file_b64)
+
 
 @app.post("/tools/check_partner_existence")
 def t_check_partner(body: PartnerExistReq, _=Depends(require_api_key)):
@@ -352,6 +364,7 @@ def t_check_partner(body: PartnerExistReq, _=Depends(require_api_key)):
     cand = sorted(cand, key=lambda x: (x.get("score", 0), x.get("usage", 0)), reverse=True)
     return {"candidates": cand}
 
+
 @app.post("/tools/supplier_usage_rank")
 def t_usage(body: SupplierUsageReq, _=Depends(require_api_key)):
     odoo = OdooClient(); odoo.authenticate()
@@ -359,13 +372,14 @@ def t_usage(body: SupplierUsageReq, _=Depends(require_api_key)):
         "account.move",
         [["move_type", "in", ["in_invoice", "in_refund"]], ["partner_id", "in", body.partner_ids]],
         ["partner_id", "id:count"],
-        ["partner_id"]
+        ["partner_id"],
     )
     data = []
     for it in rg:
         pid = it["partner_id"][0] if isinstance(it.get("partner_id"), (list, tuple)) else None
         data.append({"partner_id": pid, "invoice_count": it.get("id_count", 0)})
     return {"usage": data}
+
 
 @app.post("/tools/create_supplier_partner")
 def t_create_partner(body: CreateSupplierReq, _=Depends(require_api_key)):
@@ -386,6 +400,7 @@ def t_create_partner(body: CreateSupplierReq, _=Depends(require_api_key)):
     pid = odoo.create("res.partner", vals)
     return {"partner_id": pid}
 
+
 @app.post("/tools/resolve_account")
 def t_resolve_account(body: ResolveAccountReq, _=Depends(require_api_key)):
     odoo = OdooClient(); odoo.authenticate()
@@ -394,6 +409,7 @@ def t_resolve_account(body: ResolveAccountReq, _=Depends(require_api_key)):
         dom.append(["company_id", "=", body.company_id])
     ids = odoo.search("account.account", dom, limit=1)
     return {"account_id": ids[0]} if ids else {"account_id": None}
+
 
 @app.post("/tools/resolve_taxes")
 def t_resolve_taxes(body: ResolveTaxesReq, _=Depends(require_api_key)):
@@ -416,6 +432,7 @@ def t_resolve_taxes(body: ResolveTaxesReq, _=Depends(require_api_key)):
     tax_ids = list(dict.fromkeys(tax_ids))
     return {"tax_ids": tax_ids}
 
+
 @app.post("/tools/check_duplicate")
 def t_check_dup(body: CheckDupReq, _=Depends(require_api_key)):
     odoo = OdooClient(); odoo.authenticate()
@@ -433,6 +450,7 @@ def t_check_dup(body: CheckDupReq, _=Depends(require_api_key)):
         if abs((r.get("amount_total") or 0.0) - body.total) <= body.tolerance * max(1.0, body.total):
             return {"exists": True, "move_id": r["id"], "reason": "amount_total ~"}
     return {"exists": False}
+
 
 @app.post("/tools/create_vendor_bill")
 def t_create_bill(body: CreateBillReq, _=Depends(require_api_key)):
@@ -486,66 +504,51 @@ def t_create_bill(body: CreateBillReq, _=Depends(require_api_key)):
     move_id = odoo.create("account.move", mv)
     return {"move_id": move_id}
 
+
 @app.post("/tools/attach_file")
 def t_attach(body: AttachReq, _=Depends(require_api_key)):
     """
-    Adjunta un archivo al move:
-    1) message_post con attachments
-    2) ir.attachment directo (res_model/res_id)
-    3) Reintento con mimetype forzado si aplica
+    Adjunta archivo correctamente:
+    1) Normaliza y valida base64 -> bytes
+    2) Crea ir.attachment (datas = base64)
+    3) Lo enlaza al movimiento con message_post(attachment_ids)
     """
     odoo = OdooClient(); odoo.authenticate()
 
-    errors = []
+    # 1) normaliza y valida
     b64 = _normalize_b64(body.file_b64)
-    file_tuple = (body.filename, b64)
-    is_pdf = body.filename.lower().endswith(".pdf")
-    mimetype = "application/pdf" if is_pdf else None
-
-    # 1) message_post (chatter)
     try:
-        odoo.execute_kw(
-            "account.move", "message_post",
-            [[body.move_id]],
-            {"body": "Adjunto subido desde API", "attachments": [file_tuple]}
-        )
-        return {"attached_via": "message_post", "ok": True}
-    except Exception as e:
-        errors.append(f"message_post: {e}")
+        raw = base64.b64decode(b64, validate=True)
+    except Exception:
+        raise HTTPException(status_code=422, detail="El contenido enviado no es base64 válido.")
+    # si es PDF, comprobamos cabecera
+    if body.filename.lower().endswith(".pdf") and not raw.startswith(b"%PDF-"):
+        raise HTTPException(status_code=422, detail="El contenido no parece un PDF válido (cabecera %PDF- ausente).")
 
-    # 2) ir.attachment directo
+    # 2) crea el adjunto
     vals = {
         "name": body.filename,
         "res_model": "account.move",
         "res_id": body.move_id,
         "type": "binary",
-        "datas": b64,
+        "datas": b64,  # Odoo espera base64 aquí
+        "mimetype": "application/pdf" if body.filename.lower().endswith(".pdf") else "application/octet-stream",
     }
-    if mimetype:
-        vals["mimetype"] = mimetype
+    att_id = odoo.create("ir.attachment", vals)
+
+    # 3) enlaza en el chatter sin reenviar el binario
     try:
-        att_id = odoo.create("ir.attachment", vals)
-        return {"attachment_id": att_id, "ok": True, "via": "ir.attachment"}
-    except Exception as e:
-        errors.append(f"attachment.create: {e}")
+        odoo.execute_kw(
+            "account.move", "message_post",
+            [[body.move_id]],
+            {"body": "Archivo adjuntado desde API", "attachment_ids": [(4, att_id)]}
+        )
+    except Exception:
+        # no es crítico; el archivo ya está adjunto al registro
+        pass
 
-    # 3) Reintento con mimetype forzado (si no se había puesto)
-    if not mimetype:
-        try:
-            vals_fallback = dict(vals)
-            vals_fallback["mimetype"] = "application/octet-stream"
-            att_id = odoo.create("ir.attachment", vals_fallback)
-            return {"attachment_id": att_id, "ok": True, "via": "ir.attachment+fallback"}
-        except Exception as e:
-            errors.append(f"attachment.create.fallback: {e}")
+    return {"ok": True, "attachment_id": att_id}
 
-    raise HTTPException(
-        status_code=500,
-        detail={
-            "msg": "No se pudo adjuntar el archivo tras varios intentos",
-            "errors": errors,
-        }
-    )
 
 # ---------- ROOT & HEAD ----------
 @app.get("/", include_in_schema=False)
@@ -558,11 +561,12 @@ def root():
         "tools": ["/tools/parse_invoice", "/tools/check_partner_existence",
                   "/tools/supplier_usage_rank", "/tools/create_supplier_partner",
                   "/tools/resolve_account", "/tools/resolve_taxes",
-                  "/tools/check_duplicate", "/tools/create_vendor_bill",
-                  "/tools/attach_file"]
+                  "/tools/check_duplicate", "/tools/create_vendor_bill", "/tools/attach_file"]
     })
+
 
 @app.head("/", include_in_schema=False)
 def root_head():
     return Response(status_code=200)
+
 
