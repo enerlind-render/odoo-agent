@@ -2,19 +2,20 @@ from __future__ import annotations
 import os, time, base64, re, io, logging
 from typing import Any, List, Optional
 import requests
-from fastapi import FastAPI, Depends, Header, HTTPException, status
+from fastapi import FastAPI, Depends, Header, HTTPException, status, Response
 from pydantic import BaseModel
 from pypdf import PdfReader
 from pdf2image import convert_from_bytes
 from PIL import Image
 import pytesseract
+from fastapi.responses import JSONResponse
 
 # ---------- SEGURIDAD ----------
 def require_api_key(
     x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
     api_token_hdr: Optional[str] = Header(default=None, alias="API_TOKEN"),
 ):
-    provided = x_api_key or api_token_hdr
+    provided = (x_api_key or api_token_hdr)
     if not provided:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="API key header missing")
     expected = os.getenv("API_KEY") or os.getenv("API_TOKEN")
@@ -300,15 +301,14 @@ def t_check_partner(body: PartnerExistReq, _=Depends(require_api_key)):
             sc = SequenceMatcher(None, body.name.lower(), (r["name"] or "").lower()).ratio()
             cand.append({"id": r["id"], "name": r["name"], "vat": r.get("vat"), "score": round(sc, 3)})
 
-    # Ranking por uso
+    # Ranking por uso (sin orderby en Odoo; ordenamos en Python)
     if cand:
         ids = [c["id"] for c in cand]
         rg = odoo.read_group(
             "account.move",
             [["move_type", "in", ["in_invoice", "in_refund"]], ["partner_id", "in", ids]],
-            ["id:count"],
-            ["partner_id"],
-            orderby="id_count desc",
+            ["partner_id", "id:count"],   # incluir groupby y agregado
+            ["partner_id"]                # sin orderby
         )
         usage = {
             (it["partner_id"][0] if isinstance(it.get("partner_id"), (list, tuple)) else None): it.get("id_count", 0)
@@ -326,9 +326,8 @@ def t_usage(body: SupplierUsageReq, _=Depends(require_api_key)):
     rg = odoo.read_group(
         "account.move",
         [["move_type", "in", ["in_invoice", "in_refund"]], ["partner_id", "in", body.partner_ids]],
-        ["id:count"],
-        ["partner_id"],
-        orderby="id_count desc",
+        ["partner_id", "id:count"],   # incluir groupby y agregado
+        ["partner_id"]                # sin orderby
     )
     data = []
     for it in rg:
@@ -469,9 +468,7 @@ def t_attach(body: AttachReq, _=Depends(require_api_key)):
     att_id = odoo.create("ir.attachment", vals)
     return {"attachment_id": att_id}
 
-from fastapi import Response
-from fastapi.responses import JSONResponse
-
+# ---------- ROOT & HEAD ----------
 @app.get("/", include_in_schema=False)
 def root():
     return JSONResponse({
@@ -485,5 +482,3 @@ def root():
 @app.head("/", include_in_schema=False)
 def root_head():
     return Response(status_code=200)
-
-
