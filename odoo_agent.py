@@ -11,7 +11,6 @@ import pytesseract
 from fastapi.responses import JSONResponse
 
 # ---------- UTIL ----------
-
 def _clean_b64(s: str) -> str:
     """Elimina prefijo data:*;base64, si viene del front y devuelve solo el base64 puro."""
     if not s:
@@ -101,7 +100,7 @@ class OdooClient:
             kw["orderby"] = orderby
         if limit:
             kw["limit"] = limit
-        # args posicionales correctos: [domain, fields, groupby]
+        # args posicionales correctos: [domain, fields (agregados), groupby]
         return self.execute_kw(model, "read_group", [domain, fields, groupby], kw)
 
 # ---------- OCR / PARSER ----------
@@ -188,7 +187,8 @@ def parse_invoice_content(filename: str, file_b64: str) -> dict:
     if not desc:
         desc = " ".join(lines[:8])[:240]
 
-    conf = 0.9 if tot and (base_imp or iva) else 0.65 if ref o r vendor_hint else 0.5
+    # FIX: 'or' (no 'o r') y regla de confianza
+    conf = 0.9 if (tot and (base_imp or iva)) else (0.65 if (ref or vendor_hint) else 0.5)
 
     return {
         "text_excerpt": text[:8000],
@@ -318,8 +318,8 @@ def t_check_partner(body: PartnerExistReq, _=Depends(require_api_key)):
         rg = odoo.read_group(
             "account.move",
             [["move_type", "in", ["in_invoice", "in_refund"]], ["partner_id", "in", ids]],
-            ["partner_id", "id:count"],   # incluir groupby y agregado
-            ["partner_id"]                # sin orderby
+            ["id:count"],         # agregado
+            ["partner_id"]        # groupby
         )
         usage = {
             (it["partner_id"][0] if isinstance(it.get("partner_id"), (list, tuple)) else None): it.get("id_count", 0)
@@ -337,8 +337,8 @@ def t_usage(body: SupplierUsageReq, _=Depends(require_api_key)):
     rg = odoo.read_group(
         "account.move",
         [["move_type", "in", ["in_invoice", "in_refund"]], ["partner_id", "in", body.partner_ids]],
-        ["partner_id", "id:count"],   # incluir groupby y agregado
-        ["partner_id"]                # sin orderby
+        ["id:count"],         # agregado
+        ["partner_id"]        # groupby
     )
     data = []
     for it in rg:
@@ -526,4 +526,3 @@ def root():
 @app.head("/", include_in_schema=False)
 def root_head():
     return Response(status_code=200)
-
