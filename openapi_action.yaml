@@ -1,0 +1,263 @@
+openapi: 3.1.0
+info:
+  title: Odoo Invoice Tools
+  version: "1.0.0"
+servers:
+  - url: https://TU-DOMINIO
+components:
+  schemas:
+    GenericResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+      additionalProperties: true
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      name: X-API-Key
+      in: header
+security:
+  - ApiKeyAuth: []
+paths:
+  /health:
+    get:
+      operationId: health
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResponse"
+
+  /tools/parse_invoice:
+    post:
+      operationId: parse_invoice
+      security: [{ ApiKeyAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [filename, file_b64]
+              properties:
+                filename: { type: string }
+                file_b64: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResponse"
+
+  /tools/check_partner_existence:
+    post:
+      operationId: check_partner_existence
+      security: [{ ApiKeyAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                vat: { type: string }
+                name: { type: string }
+                country_code: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResponse"
+
+  /tools/supplier_usage_rank:
+    post:
+      operationId: supplier_usage_rank
+      security: [{ ApiKeyAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [partner_ids]
+              properties:
+                partner_ids:
+                  type: array
+                  items: { type: integer }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResponse"
+
+  /tools/create_supplier_partner:
+    post:
+      operationId: create_supplier_partner
+      security: [{ ApiKeyAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                vat: { type: string }
+                company_type: { type: string, enum: [company, person], default: company }
+                email: { type: string }
+                phone: { type: string }
+                street: { type: string }
+                city: { type: string }
+                zip: { type: string }
+                country_code: { type: string }
+                notes: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResponse"
+
+  /tools/resolve_account:
+    post:
+      operationId: resolve_account
+      security: [{ ApiKeyAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [account_code]
+              properties:
+                account_code: { type: string }
+                company_id: { type: integer }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResponse"
+
+  /tools/resolve_taxes:
+    post:
+      operationId: resolve_taxes
+      security: [{ ApiKeyAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                names:
+                  type: array
+                  items: { type: string }
+                codes:
+                  type: array
+                  items: { type: string }
+                company_id: { type: integer }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResponse"
+
+  /tools/check_duplicate:
+    post:
+      operationId: check_duplicate
+      security: [{ ApiKeyAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [partner_id, ref, total]
+              properties:
+                partner_id: { type: integer }
+                ref: { type: string }
+                total: { type: number }
+                tolerance: { type: number, default: 0.02 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResponse"
+
+  /tools/create_vendor_bill:
+    post:
+      operationId: create_vendor_bill
+      security: [{ ApiKeyAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [partner_id, invoice_date, line]
+              properties:
+                partner_id: { type: integer }
+                invoice_date: { type: string, description: "YYYY-MM-DD" }
+                ref: { type: string }
+                company_id: { type: integer }
+                line:
+                  type: object
+                  required: [name, price_unit, account_code]
+                  properties:
+                    name: { type: string }
+                    quantity: { type: number, default: 1 }
+                    price_unit: { type: number }
+                    account_code: { type: string }
+                    product_name: { type: string, default: "Sin producto" }
+                    tax_names:
+                      type: array
+                      items: { type: string }
+                    tax_codes:
+                      type: array
+                      items: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResponse"
+
+  /tools/attach_file:
+    post:
+      operationId: attach_file
+      security: [{ ApiKeyAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [move_id, filename, file_b64]
+              properties:
+                move_id: { type: integer }
+                filename: { type: string }
+                file_b64: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResponse"
