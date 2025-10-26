@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, time, base64, re, io, logging
+import os, time, base64, re, io, logging, mimetypes
 from typing import Any, List, Optional
 import requests
 from fastapi import FastAPI, Depends, Header, HTTPException, status, Response
@@ -9,6 +9,17 @@ from pdf2image import convert_from_bytes
 from PIL import Image
 import pytesseract
 from fastapi.responses import JSONResponse
+
+# ---------- UTIL ----------
+
+def _clean_b64(s: str) -> str:
+    """Elimina prefijo data:*;base64, si viene del front y devuelve solo el base64 puro."""
+    if not s:
+        return s
+    s = s.strip()
+    if s.startswith("data:") and "base64," in s:
+        return s.split("base64,", 1)[1].strip()
+    return s
 
 # ---------- SEGURIDAD ----------
 def require_api_key(
@@ -177,7 +188,7 @@ def parse_invoice_content(filename: str, file_b64: str) -> dict:
     if not desc:
         desc = " ".join(lines[:8])[:240]
 
-    conf = 0.9 if tot and (base_imp or iva) else 0.65 if ref or vendor_hint else 0.5
+    conf = 0.9 if tot and (base_imp or iva) else 0.65 if ref o r vendor_hint else 0.5
 
     return {
         "text_excerpt": text[:8000],
@@ -456,17 +467,40 @@ def t_create_bill(body: CreateBillReq, _=Depends(require_api_key)):
 
 @app.post("/tools/attach_file")
 def t_attach(body: AttachReq, _=Depends(require_api_key)):
+    """Adjunta un archivo (PDF/imagen) a un account.move. Incluye limpieza de base64,
+    datas_fname y mimetype. Con fallback si la instancia no acepta ciertos campos."""
     odoo = OdooClient(); odoo.authenticate()
+
+    # Limpia base64 y prepara nombre/mimetype
+    file_b64 = _clean_b64(body.file_b64)
+    filename = (body.filename or "adjunto.pdf").strip()
+    guessed, _ = mimetypes.guess_type(filename)
+    mimetype = guessed or ("application/pdf" if filename.lower().endswith(".pdf") else "application/octet-stream")
+
     vals = {
-        "name": body.filename,
+        "name": filename,
+        "datas_fname": filename,
         "res_model": "account.move",
         "res_id": body.move_id,
-        "type": "binary",
-        "datas": body.file_b64,
-        "mimetype": "application/pdf" if body.filename.lower().endswith(".pdf") else None,
+        "type": "binary",            # si da error en tu instancia, el fallback de abajo lo quita
+        "datas": file_b64,           # base64 puro
+        "mimetype": mimetype,
     }
-    att_id = odoo.create("ir.attachment", vals)
-    return {"attachment_id": att_id}
+
+    try:
+        att_id = odoo.create("ir.attachment", vals)
+        # (opcional) deja rastro en chatter
+        try:
+            odoo.execute_kw("account.move", "message_post", [[body.move_id]],
+                            {"body": f"Adjunto subido: {filename}", "attachment_ids": [(4, att_id)]})
+        except Exception:
+            pass
+        return {"attachment_id": att_id}
+    except Exception:
+        # Fallback: quitar campos potencialmente conflictivos
+        vals_fallback = {k: v for k, v in vals.items() if k not in ("type", "mimetype")}
+        att_id = odoo.create("ir.attachment", vals_fallback)
+        return {"attachment_id": att_id}
 
 # ---------- ROOT & HEAD ----------
 @app.get("/", include_in_schema=False)
@@ -476,9 +510,20 @@ def root():
         "ok": True,
         "health": "/health",
         "debug_auth": "/debug/odoo_auth",
-        "tools": ["/tools/parse_invoice", "/tools/check_partner_existence", "/tools/create_vendor_bill", "/tools/attach_file"]
+        "tools": [
+            "/tools/parse_invoice",
+            "/tools/check_partner_existence",
+            "/tools/supplier_usage_rank",
+            "/tools/create_supplier_partner",
+            "/tools/resolve_account",
+            "/tools/resolve_taxes",
+            "/tools/check_duplicate",
+            "/tools/create_vendor_bill",
+            "/tools/attach_file",
+        ]
     })
 
 @app.head("/", include_in_schema=False)
 def root_head():
     return Response(status_code=200)
+
