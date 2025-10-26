@@ -469,3 +469,21 @@ def t_attach(body: AttachReq, _=Depends(require_api_key)):
     att_id = odoo.create("ir.attachment", vals)
     return {"attachment_id": att_id}
 
+from fastapi import Response
+from fastapi.responses import JSONResponse
+
+@app.get("/", include_in_schema=False)
+def root():
+    return JSONResponse({
+        "service": "Odoo Invoice Tools",
+        "ok": True,
+        "health": "/health",
+        "debug_auth": "/debug/odoo_auth",
+        "tools": ["/tools/parse_invoice", "/tools/check_partner_existence", "/tools/create_vendor_bill", "/tools/attach_file"]
+    })
+
+@app.head("/", include_in_schema=False)
+def root_head():
+    return Response(status_code=200)
+
+
